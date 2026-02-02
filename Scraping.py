@@ -85,109 +85,124 @@ async def inyectar_cookies_pkl(contexto, archivo_pkl):
             print(f"Error procesando {archivo_pkl}: {e}")
     return False
 
+import os
+import csv
+
 def guardar_comentario(archivo, datos, encabezado):
     """
-    Guarda datos en un CSV sin borrar lo que ya existe.
-    Controla la creación del encabezado solo la primera vez.
+    Versión robusta: Asegura la escritura inmediata en disco (Disk Sync).
     """
-    # 1. Verificamos si el archivo ya existe
-    file_exists = os.path.isfile(archivo)
-    
-    # 2. Abrimos en modo 'a' (append / añadir al final)
-    with open(archivo, 'a', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
+    try:
+        # 1. Verificamos si existe
+        file_exists = os.path.isfile(archivo)
         
-        # 3. Si el archivo es nuevo, escribimos el título de la columna
-        if not file_exists:
-            writer.writerow(encabezado)
-        
-        # 4. Escribimos la fila con el nuevo comentario
-        writer.writerow(datos)
+        # 2. Abrimos con buffering=0 no es posible en modo texto, 
+        # así que usamos flush() manual.
+        with open(archivo, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            
+            # 3. Encabezado
+            if not file_exists:
+                writer.writerow(encabezado)
+            
+            # 4. Escribir datos
+            writer.writerow(datos)
+            
+            # 5. EL TRUCO: Forzar a Windows a escribir en el disco AHORA
+            f.flush()
+            os.fsync(f.fileno()) 
+            
+    except Exception as e:
+        print(f"❌ Error crítico al escribir en {archivo}: {e}")
+
 
 # --- FASE 2: SCRAPING (PLAYWRIGHT + PKL + DEDUPLICACIÓN) ---
 
 async def scrap_linkedin_playwright(tema):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context()
+        context = await browser.new_context(viewport={'width': 1280, 'height': 900})
         
         if await inyectar_cookies_pkl(context, "linkedin_cookies.pkl"):
             page = await context.new_page()
-            
-            tema_cod = tema.replace(' ', '%20')
-            url = f"https://www.linkedin.com/search/results/all/?keywords={tema_cod}&origin=TYPEAHEAD_HISTORY"
-            
-            print(f"🚀 [LinkedIn] Iniciando Scraping Profundo en: {url}")
+            url = f"https://www.linkedin.com/search/results/content/?keywords={tema.replace(' ', '%20')}"
+            print(f"🚀 [LinkedIn] Iniciando en: {url}")
             await page.goto(url)
-            await page.wait_for_timeout(5000)
+            await page.wait_for_timeout(7000)
 
             vistos = set()
-            # 1. Cargamos varias publicaciones primero haciendo un scroll general
-            for _ in range(3):
-                await page.evaluate("window.scrollBy(0, 1000)")
-                await page.wait_for_timeout(2000)
+            posts_ya_leidos = set()
 
-            # 2. Localizamos los botones que dicen "X comentarios"
-            # Usamos un selector que busca el botón por su función en el feed
-            botones_comentarios = page.locator('button[data-view-name="feed-comment-count"]')
-            total_posts = await botones_comentarios.count()
-            print(f"📌 Se detectaron {total_posts} publicaciones con comentarios. Procesando una por una...")
+            with open('comentarios_linkedin.csv', 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                if os.stat('comentarios_linkedin.csv').st_size == 0:
+                    writer.writerow(["texto"])
 
-            for i in range(total_posts):
-                try:
-                    boton = botones_comentarios.nth(i)
-                    
-                    # Scroll hasta el post para que LinkedIn cargue los datos
-                    await boton.scroll_into_view_if_needed()
-                    await page.wait_for_timeout(1000)
-                    
-                    # CLICK para abrir los comentarios
-                    print(f"   👉 Abriendo comentarios del Post {i+1}...")
-                    await boton.click(force=True)
-                    await page.wait_for_timeout(2000)
+                for scroll in range(4):
+                    posts = page.locator('div[role="listitem"]')
+                    total_posts = await posts.count()
+                    print(f"⏳ Iteración {scroll+1}: {total_posts} posts detectados.")
 
-                    # CLICK para poner "Más recientes" (opcional pero ayuda al volumen)
-                    try:
-                        await page.locator('button:has-text("relevantes"), button:has-text("relevant")').first.click(timeout=3000)
-                        await page.get_by_text("Más recientes").first.click(timeout=3000)
-                        await page.wait_for_timeout(2000)
-                    except: pass
+                    for i in range(total_posts):
+                        try:
+                            post_actual = posts.nth(i)
+                            ref_text = await post_actual.inner_text()
+                            post_id = hash(ref_text[:100])
+                            
+                            if post_id in posts_ya_leidos: continue
 
-                    # CLICK en "Ver más comentarios" si aparece, para sacar todo el hilo
-                    while True:
-                        boton_mas = page.get_by_role("button", name=re.compile("ver más comentarios|load more comments", re.I))
-                        if await boton_mas.count() > 0 and await boton_mas.first.is_visible():
-                            await boton_mas.first.click()
-                            await page.wait_for_timeout(2000)
-                        else:
-                            break
+                            # 1. CLICK EN ABRIR COMENTARIOS
+                            boton_abrir = post_actual.locator('div[data-view-name="feed-comment-count"]')
+                            if await boton_abrir.count() > 0:
+                                await post_actual.scroll_into_view_if_needed()
+                                await boton_abrir.first.evaluate("el => el.click()")
+                                await page.wait_for_timeout(3000)
 
-                    # 3. EXTRAER LOS COMENTARIOS REALES DEL POST ABIERTO
-                    # Usamos el data-view-name="comment-commentary" que es el estándar de LinkedIn
-                    comentarios = await page.query_selector_all('p[data-view-name="comment-commentary"]')
-                    
-                    conteo_post = 0
-                    for c in comentarios:
-                        # Extraemos el texto del span que contiene el mensaje
-                        span = await c.query_selector('span[data-testid="expandable-text-box"]')
-                        if span:
-                            t = (await span.inner_text()).strip().replace('\n', ' ')
-                            if len(t) > 10 and t not in vistos:
-                                vistos.add(t)
-                                # Guardamos usando la función acumulativa que creamos
-                                guardar_comentario('comentarios_linkedin.csv', [t], ["texto"])
-                                conteo_post += 1
-                    
-                    print(f"      [OK] {conteo_post} comentarios nuevos extraídos del Post {i+1}.")
+                                # 2. CAMBIAR A "MÁS RECIENTES" (Selector que enviaste)
+                                try:
+                                    sort_toggle = post_actual.locator('div[data-view-name="comment-sort-toggle"]')
+                                    if await sort_toggle.count() > 0:
+                                        await sort_toggle.click()
+                                        await page.wait_for_timeout(1500)
+                                        # Click en la opción del menú que aparece
+                                        await page.get_by_text("Más recientes").first.click()
+                                        await page.wait_for_timeout(2500)
+                                except: pass
 
-                except Exception as e:
-                    print(f"      [!] No se pudieron extraer comentarios del Post {i+1}")
-                    continue
+                                # 3. EXPANDIR HILO (Cargar más comentarios)
+                                while True:
+                                    boton_mas = post_actual.locator('button[data-view-name="more-comments"]')
+                                    if await boton_mas.count() > 0 and await boton_mas.is_visible():
+                                        await boton_mas.first.click()
+                                        await page.wait_for_timeout(2500)
+                                    else:
+                                        break
 
-            print(f"✅ [LinkedIn] Sesión terminada. Total únicos en esta vuelta: {len(vistos)}")
-        else:
-            print("❌ No se encontró linkedin_cookies.pkl")
-            
+                                # 4. EXTRACCIÓN (Selector exacto de tu HTML)
+                                selector_txt = 'p[data-view-name="comment-commentary"] span[data-testid="expandable-text-box"]'
+                                elementos = await post_actual.locator(selector_txt).all()
+                                
+                                nuevos = 0
+                                for el in elementos:
+                                    t = (await el.inner_text()).strip().replace('\n', ' ')
+                                    if len(t) > 15 and t not in vistos:
+                                        vistos.add(t)
+                                        writer.writerow([t])
+                                        nuevos += 1
+                                
+                                if nuevos > 0:
+                                    f.flush()
+                                    os.fsync(f.fileno())
+                                    print(f"      ✅ Post {i+1}: {nuevos} comentarios nuevos.")
+                                
+                                posts_ya_leidos.add(post_id)
+
+                        except Exception: continue
+
+                    await page.keyboard.press("PageDown")
+                    await page.wait_for_timeout(3000)
+
+            print(f"✨ LinkedIn finalizado. Total: {len(vistos)}")
         await browser.close()
 
 async def scrap_facebook_playwright(tema):
@@ -625,14 +640,15 @@ def run_advanced_nlp():
 # =================================================================================================
 
 if __name__ == "__main__":
-    tema = 'Nicolas Muñoz'
+    tema = 'ChatGPT'
+
     
     # 1. EJECUCIÓN PARALELA DE SCRAPERS
     hilos = [
         threading.Thread(target=run_async, args=(scrap_linkedin_playwright, tema)),
-        threading.Thread(target=run_async, args=(scrap_x_playwright, tema)),
-        threading.Thread(target=run_async, args=(scrap_facebook_playwright, tema)),
-        threading.Thread(target=run_async, args=(scrap_instagram_playwright, tema))
+        # threading.Thread(target=run_async, args=(scrap_x_playwright, tema)),
+        # threading.Thread(target=run_async, args=(scrap_facebook_playwright, tema)),
+        # threading.Thread(target=run_async, args=(scrap_instagram_playwright, tema))
     ]
 
     print(f"🚀 Iniciando recolección paralela masiva para: {tema}")
@@ -697,7 +713,7 @@ if __name__ == "__main__":
         WordCloud(width=1000, height=500, background_color='white').generate(" ".join(todos_los_tokens)).to_file("nube_final.png")
         df.to_csv('resultados_finales_grado.csv', index=False)
 
-        run_advanced_nlp()
+        # run_advanced_nlp()
         
         print("="*50)
         print("✨ PROCESO FINALIZADO: Dataset guardado y Nube generada.")
